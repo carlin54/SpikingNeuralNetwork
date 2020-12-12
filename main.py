@@ -497,8 +497,6 @@ class Convolution2D(Layer):
         self.padding = 0
 
     def build(self, input_shape):
-
-
         k = 2
 
         sample_shape = input_shape[-3:]
@@ -617,7 +615,6 @@ class Flatten(Layer):
     def compute_output_shape(self, sample_shape):
         return tuple([math.prod(sample_shape)])
     
-    
     def build(self, input_shape):
         self.input_shape = input_shape
         self.output_shape = self.compute_output_shape(input_shape)
@@ -694,16 +691,24 @@ class Dense(Layer):
         return Z, cache
 
     def backward_propagate(self, dZ, cache):
-        A = cache['A']
-        dW = np.dot(self.weights.T,dZ)
+        A_prev = cache['A']
+        batch_shape = dZ.shape[:-1]
+        dW = np.ndarray(shape=batch_shape + self.weights.shape)
         db = None
-        dA = np.dot(dZ, np.transpose(A))
+        dA = np.ndarray(shape=batch_shape + A_prev.shape)
+        for batch_idx in np.ndindex(batch_shape):
+            DW = np.dot(self.weights.T, dZ[batch_idx])
+            DA = np.dot(dZ[batch_idx], A_prev[batch_idx].T)
+            dW[batch_idx] = np.dot(self.weights.T, dZ[batch_idx])
+            db = None
+            dA[batch_idx] = np.dot(dZ[batch_idx], A.T)
 
         assert (dA.shape == A.shape)
         assert (dW.shape == self.weights.shape)
 
         return dZ, dW, db
         
+
 class Membrane:
 
     def __init__(self):
@@ -794,19 +799,19 @@ class LeakyIntegrateAndFire(Membrane):
         cache = {
             'Vp' : Vp,
             'Vout' : Vout,
-            'spike_train' : spike_train
+            'spike_train' : spike_train,
+            'tau_m' : tau_m
         }
 
         return spike_train, cache
 
-    def __diff_LIF(self, dA, cache):
-        Vp = cache['Vp']
-        spike_train = cache['spike_train']
-
+    @staticmethod
+    def __compute_spike_train_decay(spike_train):
         # sum of decay over time
+        total_decay = 0
         gamma = sum(spike_train)
         if gamma == 0:
-            return 0
+            return [total_decay, gamma]
 
         total_decay = 0
         t = tk = 1
@@ -821,37 +826,68 @@ class LeakyIntegrateAndFire(Membrane):
                 tk = t + 1
             t = t + 1
 
-        dZ = dA * (1 / self.Vth) * (1 + (1 / gamma) * total_decay)
+        return [total_decay, gamma]
+
+    def __diff_LIF(self, dA, cache):
+        Vp = cache['Vp']
+        spike_trains = cache['spike_train']
+        tau_m = cache['tau_m']
+
+        batch_shape = Vp.shape[:-self.__num_input_dimensions]
+        membrane_shape = Vp.shape[-self.__num_input_dimensions:]
+
+        dZ_shape = batch_shape + membrane_shape
+        dZ = np.ndarray(shape=dZ_shape)
+        dZ.fill(-9e99)
+
+        for batch_idx in np.ndindex(batch_shape):
+            for neuron_idx in np.ndindex(membrane_shape):
+                idx = batch_idx + neuron_idx
+                spike_train = spike_trains[idx]
+                [total_decay, gamma] = LeakyIntegrateAndFire.__compute_spike_train_decay(spike_train)
+
+                dZ[idx] = dA[idx] * (1 / self.Vth) * (1 + (1 / gamma) * total_decay)
+
         return dZ
 
     def __diff_LI(self, dA, cache):
-        dZ = (1/tau_m) * dA
+        Vp = cache['Vp']
+        spike_trains = cache['spike_train']
+        tau_m = cache['tau_m']
+
+        batch_shape = Vp.shape[:-self.__num_input_dimensions]
+        membrane_shape = Vp.shape[-self.__num_input_dimensions:]
+
+        dZ_shape = batch_shape + membrane_shape
+        dZ = np.ndarray(shape=dZ_shape, dtype=np.float64)
+        dZ.fill(-9e99)
+
+        for batch_idx in np.ndindex(batch_shape):
+            for neuron_idx in np.ndindex(membrane_shape):
+                idx = batch_idx + neuron_idx
+                dZ[idx] = (1/tau_m) * (Vp[idx]) * dA[idx]
+
+
         return dZ
 
     def __diff_IF(self, dA, cache):
-        pass
+        return None
 
     def __diff_I(self, dA, cache):
-        pass
+        return None
 
     def differentiate(self, dA, cache):
-        # LIF Neuron
-        Vp = cache['Vp']
-        spike_train = cache['spike_train']
-        dZ = None
-        tau_m = len(spike_train)
-
         if self.leaky:
             if self.fire:
-                return self.__diff_LIF()
-        else:
-            # LI neuron
-            if self.fire:
-
+                return self.__diff_LIF(dA, cache)
             else:
+                return self.__diff_LI(dA, cache)
+        else:
+            if self.fire:
+                return self.__diff_IF(dA, cache)
+            else:
+                return self.__diff_I(dA, cache)
 
-
-        return dZ
 
     def get_output_shape(self):
         return self.output_shape
@@ -941,7 +977,8 @@ class SpikingNeuralNetwork:
         return 0.5 * np.sum(np.power((A - Y), 2))
 
     def compute_loss(self, A, Y):
-        return np.mean(np.square(Y - A), axis=-2)
+        # np.mean(np.square(Y - A), axis=-2) <- MSE loss
+        return Y - A
 
 
     def backward_propagation(self, AL, caches, Y):
@@ -953,7 +990,7 @@ class SpikingNeuralNetwork:
         dZ, dW, db = (None, None, None)
 
         # derivative of activation in final layer
-        dAL = [self.compute_loss(AL, Y)]
+        dAL = self.compute_loss(AL, Y)
         grad = [
             {
                 "dZ": None,
@@ -1132,7 +1169,7 @@ LeNet5.add_layer(Dropout(probability=dropout_rate))
 
 LeNet5.add_layer(Flatten())
 LeNet5.add_layer(Dense(num_outputs=200), LeakyIntegrateAndFire(0, 1, tau_m, fire=True, leaky=True))
-LeNet5.add_layer(Dense(num_outputs=10), LeakyIntegrateAndFire(0, 1, tau_m, fire=False, leaky=False))
+LeNet5.add_layer(Dense(num_outputs=10), LeakyIntegrateAndFire(0, 1, tau_m, fire=False, leaky=True))
 
 input_shape = train_images[0].shape
 
@@ -1142,7 +1179,7 @@ input_images = np.array([generate_layer_spike_train(train_images[0], tau_m), gen
 
 LeNet5.build(input_images[0].shape)
 lbl = train_labels[0:5,:]
-LeNet5.fit(input_images, train_labels[0:5,:], batch_size=2)
+LeNet5.fit(input_images, train_labels[0:5,:], batch_size=2,learning_rate=0.002)
 LeNet5.predict(test_images, test_labels)
 
 class Model:
